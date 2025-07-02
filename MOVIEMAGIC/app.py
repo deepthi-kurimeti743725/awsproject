@@ -1,12 +1,17 @@
 from flask import Flask, render_template, request, redirect, url_for, session
 import random
+import boto3
+import uuid
+app=Flask(__name__)
 
-app = Flask(__name__)
-app.secret_key = 'movie-magic-secret'
+dynamodb = boto3.resource('dynamodb', region_name='us-east-1')
+sns = boto3.client('sns', region_name='us-east-1')
 
-# Sample users and bookings
-users = []
-bookings = []
+users_table = dynamodb.Table('MovieMagic_Users')
+bookings_table = dynamodb.Table('MovieMagic_Bookings')
+
+SNS_TOPIC_ARN = 'arn:aws:sns:us-east-1:975050316116:MovieTicketNotifications'  # Replace this
+
 
 # Movie list
 movies = [
@@ -32,8 +37,9 @@ def login():
         email = request.form.get('email')
         password = request.form.get('password')
         remember = request.form.get('remember')
-        user = next((u for u in users if u['email'] == email and u['password'] == password), None)
-        if user:
+        response = users_table.get_item(Key={'Email': email})
+        user = response.get('Item')
+        if user and user['Password'] == password:
             session['user'] = email
             if remember:
                 session.permanent = True
@@ -47,9 +53,10 @@ def register():
         email = request.form.get('email')
         password = request.form.get('password')
         phone = request.form.get('phone')
-        if any(u['email'] == email for u in users):
+        response = users_table.get_item(Key={'Email': email})
+        if 'Item' in response:
             return render_template('register.html', error='User already exists')
-        users.append({'email': email, 'password': password, 'phone': phone})
+        users_table.put_item(Item={'Email': email, 'Password': password, 'Phone': phone})
         return redirect(url_for('login'))
     return render_template('register.html')
 
@@ -87,7 +94,14 @@ def book_ticket(id):
             return render_template("book.html", movie=movie, error="Please fill all fields")
         try:
             tickets = int(tickets)
-            bookings.append({'movie': movie['name'], 'user': name, 'count': tickets})
+            booking_id = f"BK{random.randint(1000,9999)}"
+            bookings_table.put_item(Item={
+                'Bookingid': booking_id,
+                'Email': session['user'],
+                'Movie': movie['name'],
+                'User': name,
+                'Tickets': tickets
+            })
             return render_template('success.html', movie=movie, name=name, tickets=tickets)
         except ValueError:
             return render_template("book.html", movie=movie, error="Invalid ticket number")
@@ -95,19 +109,20 @@ def book_ticket(id):
 
 @app.route('/admin')
 def admin():
-    return render_template('admin.html', bookings=bookings)
+    response = bookings_table.scan()
+    all_bookings = response.get('Items', [])
+    return render_template('admin.html', bookings=all_bookings)
 
 @app.route('/contact')
 def contact():
     return render_template('contact_us.html')
 
-# -------------------- Forgot Password Flow ------------------------
-
 @app.route('/forgot', methods=['GET', 'POST'])
 def forgot():
     if request.method == 'POST':
         email = request.form.get('email')
-        user = next((u for u in users if u['email'] == email), None)
+        response = users_table.get_item(Key={'Email': email})
+        user = response.get('Item')
         if user:
             code = random.randint(1000, 9999)
             session['reset_code'] = code
@@ -133,14 +148,15 @@ def reset_password():
     if request.method == 'POST':
         new_pass = request.form.get('password')
         email = session.get('reset_email')
-        for user in users:
-            if user['email'] == email:
-                user['password'] = new_pass
-                session.pop('reset_email', None)
-                session.pop('reset_code', None)
-                return redirect(url_for('login'))
-        return "User not found."
+        users_table.update_item(
+            Key={'Email': email},
+            UpdateExpression='SET Password = :p',
+            ExpressionAttributeValues={':p': new_pass}
+        )
+        session.pop('reset_email', None)
+        session.pop('reset_code', None)
+        return redirect(url_for('login'))
     return render_template('reset_password.html')
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    app.run(host='0.0.0.0', port=5000, debug=True)
